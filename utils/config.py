@@ -23,32 +23,10 @@ class Config:
         
     def _validate_env_vars(self) -> None:
         """验证必需的环境变量"""
-        # 检查是否有测试环境配置
-        testnet_mode = os.getenv("BINANCE_TESTNET", "true").lower() == "true"
-        
-        if testnet_mode:
-            # 测试环境：检查测试环境API密钥
-            testnet_key = os.getenv("BINANCE_TESTNET_API_KEY")
-            testnet_secret = os.getenv("BINANCE_TESTNET_API_SECRET")
-            
-            if not testnet_key or not testnet_secret:
-                print("⚠️  警告: 测试环境API密钥未设置，将使用主网API密钥进行测试")
-                # 回退到主网API密钥
-                if not os.getenv("BINANCE_API_KEY") or not os.getenv("BINANCE_API_SECRET"):
-                    raise ConfigError(
-                        "缺少Binance API密钥。请设置BINANCE_API_KEY和BINANCE_API_SECRET环境变量"
-                    )
-        else:
-            # 生产环境：检查主网API密钥
-            if not os.getenv("BINANCE_API_KEY") or not os.getenv("BINANCE_API_SECRET"):
-                raise ConfigError(
-                    "生产环境缺少Binance API密钥。请设置BINANCE_API_KEY和BINANCE_API_SECRET环境变量"
-                )
-        
         # 检查Telegram Bot Token
         if not os.getenv("TELEGRAM_BOT_TOKEN"):
             raise ConfigError("缺少TELEGRAM_BOT_TOKEN环境变量")
-        
+
         # 验证Telegram用户ID格式
         allowed_ids_str = os.getenv("TELEGRAM_ALLOWED_USER_IDS", "")
         if allowed_ids_str:
@@ -58,6 +36,42 @@ class Config:
                     raise ConfigError("TELEGRAM_ALLOWED_USER_IDS不能为空")
             except ValueError:
                 raise ConfigError("TELEGRAM_ALLOWED_USER_IDS格式错误，应为逗号分隔的整数")
+
+        # 验证 API 密钥必须成对出现
+        self._validate_key_pair(
+            "BINANCE_TESTNET_API_KEY",
+            "BINANCE_TESTNET_API_SECRET",
+            "测试环境",
+        )
+        self._validate_key_pair(
+            "BINANCE_API_KEY",
+            "BINANCE_API_SECRET",
+            "生产环境",
+        )
+
+    def _validate_key_pair(self, key_name: str, secret_name: str, env_name: str) -> None:
+        """验证 API 密钥必须成对设置"""
+        has_key = bool(os.getenv(key_name))
+        has_secret = bool(os.getenv(secret_name))
+
+        if has_key != has_secret:
+            raise ConfigError(
+                f"{env_name} API 密钥配置不完整，请同时设置 {key_name} 和 {secret_name}"
+            )
+
+    def _require_environment_keys(self, environment: str) -> None:
+        """验证当前环境所需的 API 密钥已完整设置"""
+        if environment == "testnet":
+            if not os.getenv("BINANCE_TESTNET_API_KEY") or not os.getenv("BINANCE_TESTNET_API_SECRET"):
+                raise ConfigError(
+                    "测试环境缺少 API 密钥。请设置 BINANCE_TESTNET_API_KEY 和 BINANCE_TESTNET_API_SECRET"
+                )
+            return
+
+        if not os.getenv("BINANCE_API_KEY") or not os.getenv("BINANCE_API_SECRET"):
+            raise ConfigError(
+                "生产环境缺少 API 密钥。请设置 BINANCE_API_KEY 和 BINANCE_API_SECRET"
+            )
     
     def _load_settings(self) -> None:
         """加载设置文件"""
@@ -119,34 +133,24 @@ class Config:
         """获取当前环境的Binance API Key"""
         settings = self.load_settings()
         environment = settings.get("environment", "testnet")
-        
+        self._require_environment_keys(environment)
+
         if environment == "testnet":
-            # 优先使用测试环境专用API密钥
-            testnet_key = os.getenv("BINANCE_TESTNET_API_KEY")
-            if testnet_key:
-                return testnet_key
-            # 回退到主网API密钥
-            return os.getenv("BINANCE_API_KEY", "")
-        else:
-            # 生产环境使用主网API密钥
-            return os.getenv("BINANCE_API_KEY", "")
-    
+            return os.getenv("BINANCE_TESTNET_API_KEY", "")
+
+        return os.getenv("BINANCE_API_KEY", "")
+
     @property
     def api_secret(self) -> str:
         """获取当前环境的Binance API Secret"""
         settings = self.load_settings()
         environment = settings.get("environment", "testnet")
-        
+        self._require_environment_keys(environment)
+
         if environment == "testnet":
-            # 优先使用测试环境专用API密钥
-            testnet_secret = os.getenv("BINANCE_TESTNET_API_SECRET")
-            if testnet_secret:
-                return testnet_secret
-            # 回退到主网API密钥
-            return os.getenv("BINANCE_API_SECRET", "")
-        else:
-            # 生产环境使用主网API密钥
-            return os.getenv("BINANCE_API_SECRET", "")
+            return os.getenv("BINANCE_TESTNET_API_SECRET", "")
+
+        return os.getenv("BINANCE_API_SECRET", "")
     
     @property
     def testnet(self) -> bool:
@@ -180,12 +184,9 @@ class Config:
         }
         
         if environment == "testnet":
-            if os.getenv("BINANCE_TESTNET_API_KEY"):
-                info["api_key_source"] = "测试环境专用密钥"
-            else:
-                info["api_key_source"] = "主网密钥（测试环境）"
+            info["api_key_source"] = "测试环境专用密钥" if info["has_testnet_keys"] else "未配置"
         else:
-            info["api_key_source"] = "主网密钥"
+            info["api_key_source"] = "主网密钥" if info["has_mainnet_keys"] else "未配置"
         
         return info
     
@@ -258,11 +259,9 @@ class Config:
                 raise ConfigError(f"无效的环境设置: {environment}")
             
             # 检查环境切换的安全性
+            self._require_environment_keys(environment)
+
             if environment == "mainnet":
-                # 切换到生产环境时，检查是否有主网API密钥
-                if not os.getenv("BINANCE_API_KEY") or not os.getenv("BINANCE_API_SECRET"):
-                    raise ConfigError("切换到生产环境需要设置BINANCE_API_KEY和BINANCE_API_SECRET环境变量")
-                
                 # 检查当前是否在测试环境有未平仓的测试仓位
                 current_env = self.load_settings().get("environment", "testnet")
                 if current_env == "testnet":

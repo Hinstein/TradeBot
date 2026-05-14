@@ -167,7 +167,16 @@ class BinanceClient:
     def query_order(self, symbol: str, orderId: int) -> Dict[str, Any]:
         """查询订单"""
         return self._client.query_order(symbol=symbol, orderId=orderId)
-    
+
+    @retry_binance_api
+    def query_algo_order(self, symbol: str, algoId: int) -> Dict[str, Any]:
+        """查询条件单"""
+        return self.sign_request("GET", "/fapi/v1/algoOrder", {
+            "symbol": symbol,
+            "algoId": algoId,
+            "recvWindow": 10000,
+        })
+
     @retry_binance_api
     def cancel_order(self, symbol: str, orderId: int) -> Dict[str, Any]:
         """取消订单"""

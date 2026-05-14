@@ -89,9 +89,6 @@ class TradeExecutor:
             symbol_info = self.order_manager.resolve_symbol(token)
             symbol = symbol_info["symbol"]
             
-            # 设置交易参数
-            self.order_manager.setup_trading(symbol, leverage, margin_type)
-            
             # 获取标记价格
             mark_price = Decimal(self.client.mark_price(symbol=symbol)["markPrice"])
             
@@ -112,7 +109,10 @@ class TradeExecutor:
 
             # 获取平均成交价
             entry = self.order_manager.get_avg_fill_price(symbol, order)
-            
+
+            # 开仓后再设置交易参数，优先缩短 MARKET 下单前延迟
+            self.order_manager.setup_trading(symbol, leverage, margin_type)
+
             # 获取价格步长
             from trader.client import _filter_value
             tick = _filter_value(symbol_info, "PRICE_FILTER", "tickSize")
@@ -145,30 +145,31 @@ class TradeExecutor:
             if split_tp:
                 # 分批止盈逻辑
                 step = _filter_value(symbol_info, "LOT_SIZE", "stepSize")
-                half_qty = (qty / Decimal(2)).quantize(step, rounding=ROUND_DOWN)
-                
-                if half_qty <= 0:
+                tp1_qty = (qty / Decimal(2)).quantize(step, rounding=ROUND_DOWN)
+                tp2_qty = qty - tp1_qty
+
+                if tp1_qty <= 0 or tp2_qty <= 0:
                     raise TradeError("数量太小，无法分批止盈")
-                
+
                 # 放置第一批止盈单
                 tp1_order = self.client.new_order(
                     symbol=symbol,
                     side=close_side,
                     type="LIMIT",
                     price=format(tp1_price, "f"),
-                    quantity=format(half_qty, "f"),
+                    quantity=format(tp1_qty, "f"),
                     timeInForce="GTC",
                     reduceOnly="true",
                     recvWindow=10000,
                 )
-                
+
                 # 放置第二批止盈单
                 tp2_order = self.client.new_order(
                     symbol=symbol,
                     side=close_side,
                     type="LIMIT",
                     price=format(tp2_price, "f"),
-                    quantity=format(half_qty, "f"),
+                    quantity=format(tp2_qty, "f"),
                     timeInForce="GTC",
                     reduceOnly="true",
                     recvWindow=10000,

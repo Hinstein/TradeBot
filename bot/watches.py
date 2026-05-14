@@ -40,6 +40,7 @@ class WatchManager:
         self.stream_lock = threading.Lock()
         self.stopping = False
         self.reconnect_attempts = 0
+        self.restore_alerts_sent: set[tuple[str, str, str]] = set()
 
     async def notify_plain(self, chat_id: int, text: str) -> None:
         """发送普通通知"""
@@ -47,6 +48,67 @@ class WatchManager:
             await self.app.bot.send_message(chat_id=chat_id, text=text)
         except Exception as e:
             logger.warning(f"通知聊天 {chat_id} 失败: {format_exception(e)}")
+
+    async def _notify_restore_issue(self, symbol: str, watch: Dict[str, Any], state: str, reason: str) -> None:
+        """通知恢复阶段发现的高风险监控异常"""
+        if not self._should_alert_restore_reason(reason):
+            logger.info(f"恢复异常已降噪为仅日志: {symbol} state={state} reason={reason}")
+            return
+
+        dedupe_key = (symbol, state, reason)
+        if dedupe_key in self.restore_alerts_sent:
+            logger.info(f"跳过重复恢复告警: {symbol} state={state} reason={reason}")
+            return
+
+        chat_id = watch.get("notify_chat")
+        if not chat_id:
+            logger.warning(f"监控任务恢复异常缺少 notify_chat: {symbol} state={state} reason={reason}")
+            return
+
+        phase = watch.get("phase", 1)
+        result = "已从本地清理" if state == "stale" else "本次未恢复监控"
+        reason_text = self._format_restore_reason(reason)
+
+        text = (
+            f"⚠️ 恢复监控时发现 {symbol} 状态异常 "
+            f"(phase={phase}，原因：{reason_text})，{result}，请手动检查仓位和挂单。"
+        )
+        self.restore_alerts_sent.add(dedupe_key)
+        await self.notify_plain(chat_id, text)
+
+    def _should_alert_restore_reason(self, reason: str) -> bool:
+        """判断恢复异常是否需要主动告警"""
+        alert_reasons = {
+            "state_check_failed",
+            "tp1_missing",
+            "tp2_missing",
+            "sl_missing",
+            "phase_conflict_tp2",
+            "phase_conflict_sl",
+            "phase_unknown",
+        }
+        return reason in alert_reasons
+
+    def _reset_restore_alerts(self) -> None:
+        """开始新一轮恢复前清空本轮告警去重状态"""
+        self.restore_alerts_sent.clear()
+
+    def _format_restore_reason(self, reason: str) -> str:
+        """将恢复阶段内部原因转换为更易读的提示"""
+        reason_map = {
+            "state_check_failed": "状态校验失败",
+            "position_missing": "未查到仓位信息",
+            "position_closed": "仓位已平",
+            "tp1_missing": "TP1 订单不存在或已失效",
+            "tp2_missing": "TP2 订单不存在或已失效",
+            "sl_missing": "止损单不存在或已失效",
+            "phase1_orders_ok": "Phase 1 订单状态正常",
+            "phase2_orders_ok": "Phase 2 订单状态正常",
+            "phase_conflict_tp2": "TP2 状态与本地监控不一致",
+            "phase_conflict_sl": "止损单状态与本地监控不一致",
+            "phase_unknown": "本地监控阶段未知",
+        }
+        return reason_map.get(reason, reason)
 
     def remove_watch(self, symbol: str) -> None:
         """移除监控任务"""
@@ -90,18 +152,396 @@ class WatchManager:
         self.stop_user_stream()
         logger.info("所有监控任务已停止")
 
+    def _reset_restore_alerts(self) -> None:
+        """开始新一轮恢复前清空本轮告警去重状态"""
+        self.restore_alerts_sent.clear()
+
+    def _format_restore_reason(self, reason: str) -> str:
+        """将恢复阶段内部原因转换为更易读的提示"""
+        reason_map = {
+            "state_check_failed": "状态校验失败",
+            "position_missing": "未查到仓位信息",
+            "position_closed": "仓位已平",
+            "tp1_missing": "TP1 订单不存在或已失效",
+            "tp2_missing": "TP2 订单不存在或已失效",
+            "sl_missing": "止损单不存在或已失效",
+            "phase1_orders_ok": "Phase 1 订单状态正常",
+            "phase2_orders_ok": "Phase 2 订单状态正常",
+            "phase_conflict_tp2": "TP2 状态与本地监控不一致",
+            "phase_conflict_sl": "止损单状态与本地监控不一致",
+            "phase_unknown": "本地监控阶段未知",
+        }
+        return reason_map.get(reason, reason)
+
+    def remove_watch(self, symbol: str) -> None:
+        """移除监控任务"""
+        watches = self.config.load_watches()
+        watches.pop(symbol, None)
+        self.config.save_watches(watches)
+        self.watch_tasks.pop(symbol, None)
+        logger.info(f"监控任务已移除: {symbol}")
+
+    def start_watch(self, symbol: str, watch: Dict[str, Any]) -> None:
+        """注册监控任务并确保用户数据流运行"""
+        self.watch_tasks[symbol] = asyncio.create_task(self._watch_placeholder(symbol))
+        self._ensure_stream()
+        logger.info(f"监控任务已启动: {symbol} phase={watch.get('phase', 1)}")
+
+    async def _watch_placeholder(self, symbol: str) -> None:
+        try:
+            while symbol in self.config.load_watches():
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            logger.info(f"监控 {symbol}: 已取消")
+
+    def stop_watch(self, symbol: str) -> bool:
+        """停止监控任务"""
+        exists = symbol in self.config.load_watches() or symbol in self.watch_tasks
+        task = self.watch_tasks.get(symbol)
+        if task and not task.done():
+            task.cancel()
+        self.remove_watch(symbol)
+        if not self.config.load_watches():
+            self.stop_user_stream()
+        logger.info(f"监控任务已停止: {symbol}")
+        return exists
+
+    def stop_all_watches(self) -> None:
+        """停止所有监控任务"""
+        for task in self.watch_tasks.values():
+            if not task.done():
+                task.cancel()
+        self.watch_tasks.clear()
+        self.stop_user_stream()
+        logger.info("所有监控任务已停止")
+
+    async def _notify_restore_summary(
+        self,
+        restored_symbols: list[str],
+        stale_symbols: list[str],
+        skipped_symbols: list[str],
+    ) -> None:
+        """发送恢复结果汇总通知"""
+        watches = self.config.load_watches()
+        chat_ids = {
+            watch.get("notify_chat")
+            for watch in watches.values()
+            if watch.get("notify_chat")
+        }
+
+        if not chat_ids:
+            logger.info("恢复汇总未发送：没有可用的 notify_chat")
+            return
+
+        def format_symbols(symbols: list[str]) -> str:
+            return "、".join(symbols) if symbols else "无"
+
+        text = (
+            "📋 本次监控恢复完成\n"
+            f"恢复成功: {len(restored_symbols)} ({format_symbols(restored_symbols)})\n"
+            f"已清理: {len(stale_symbols)} ({format_symbols(stale_symbols)})\n"
+            f"待人工检查: {len(skipped_symbols)} ({format_symbols(skipped_symbols)})"
+        )
+
+        for chat_id in chat_ids:
+            await self.notify_plain(chat_id, text)
+
     def restore_watches(self) -> None:
         """从磁盘恢复监控任务"""
+        asyncio.create_task(self._restore_watches_async())
+
+    async def _restore_watches_async(self) -> None:
+        """并发校验并恢复监控任务"""
+        self._reset_restore_alerts()
         watches = self.config.load_watches()
         if not watches:
             logger.info("没有需要恢复的监控任务")
             return
 
-        logger.info(f"从磁盘恢复 {len(watches)} 个监控任务")
+        watch_items = list(watches.items())
+        logger.info(f"开始校验并恢复 {len(watch_items)} 个监控任务")
+
+        state_tasks = [
+            asyncio.to_thread(self._get_restore_state, symbol, watch)
+            for symbol, watch in watch_items
+        ]
+        states = await asyncio.gather(*state_tasks)
+
+        restored = 0
+        stale = 0
+        skipped = 0
+        restored_symbols: list[str] = []
+        stale_symbols: list[str] = []
+        skipped_symbols: list[str] = []
+
+        for (symbol, watch), (state, reason) in zip(watch_items, states):
+            if state == "valid":
+                self.watch_tasks[symbol] = asyncio.create_task(self._watch_placeholder(symbol))
+                restored += 1
+                restored_symbols.append(symbol)
+                logger.info(f"监控任务已恢复: {symbol} phase={watch.get('phase', 1)} reason={reason}")
+            elif state == "stale":
+                self.remove_watch(symbol)
+                stale += 1
+                stale_symbols.append(symbol)
+                logger.info(f"监控任务已清理: {symbol} reason={reason}")
+                asyncio.create_task(self._notify_restore_issue(symbol, watch, state, reason))
+            else:
+                skipped += 1
+                skipped_symbols.append(symbol)
+                logger.warning(f"监控任务跳过恢复: {symbol} reason={reason}")
+                asyncio.create_task(self._notify_restore_issue(symbol, watch, state, reason))
+
+        if skipped and not restored and not stale:
+            logger.warning("监控任务校验未能确认任何实时状态，本次未恢复本地 watch")
+
+        if restored:
+            self._ensure_stream()
+        elif stale and not skipped:
+            logger.info("监控任务校验完成，所有本地 watch 都已清理")
+
+        logger.info(
+            f"监控任务恢复完成: restored={restored}, stale={stale}, skipped={skipped}"
+        )
+        asyncio.create_task(
+            self._notify_restore_summary(restored_symbols, stale_symbols, skipped_symbols)
+        )
+
+        return
+
+        if skipped and not restored and not stale:
+            logger.warning("监控任务校验未能确认任何实时状态，本次未恢复本地 watch")
+
+        if restored:
+            self._ensure_stream()
+        elif stale and not skipped:
+            logger.info("监控任务校验完成，所有本地 watch 都已清理")
+
+        logger.info(
+            f"监控任务恢复完成: restored={restored}, stale={stale}, skipped={skipped}"
+        )
+        asyncio.create_task(
+            self._notify_restore_summary(restored_symbols, stale_symbols, skipped_symbols)
+        )
+
+    def _get_restore_state(self, symbol: str, watch: Dict[str, Any]) -> tuple[str, str]:
+        """检查监控任务是否仍需恢复"""
+        try:
+            client = create_client(self.config.api_key, self.config.api_secret, self.config.testnet)
+            positions = client.get_position_risk(symbol=symbol)
+        except Exception as e:
+            logger.warning(f"校验监控任务失败 {symbol}: {format_exception(e)}")
+            return "unknown", "state_check_failed"
+
+        if not positions:
+            return "stale", "position_missing"
+
+        position = positions[0]
+        amount = Decimal(position.get("positionAmt", "0"))
+        if amount == Decimal("0"):
+            return "stale", "position_closed"
+
+        try:
+            phase = int(watch.get("phase", 1))
+            if phase == 1:
+                if not self._is_regular_order_active(client, symbol, watch.get("tp1_order_id")):
+                    return "stale", "tp1_missing"
+                if not self._is_regular_order_active(client, symbol, watch.get("tp2_order_id")):
+                    return "stale", "tp2_missing"
+                if not self._is_algo_order_active(client, symbol, watch.get("sl_id")):
+                    return "stale", "sl_missing"
+                return "valid", "phase1_orders_ok"
+
+            if phase == 2:
+                if not self._is_regular_order_active(client, symbol, watch.get("tp2_order_id")):
+                    return "unknown", "phase_conflict_tp2"
+                if not self._is_algo_order_active(client, symbol, watch.get("sl_id")):
+                    return "unknown", "phase_conflict_sl"
+                return "valid", "phase2_orders_ok"
+
+            return "unknown", "phase_unknown"
+        except Exception as e:
+            logger.warning(f"校验订单状态失败 {symbol}: {format_exception(e)}")
+            return "unknown", "state_check_failed"
+
+    def _get_restore_state(self, symbol: str, watch: Dict[str, Any]) -> tuple[str, str]:
+        """检查监控任务是否仍需恢复"""
+        try:
+            client = create_client(self.config.api_key, self.config.api_secret, self.config.testnet)
+            positions = client.get_position_risk(symbol=symbol)
+        except Exception as e:
+            logger.warning(f"校验监控任务失败 {symbol}: {format_exception(e)}")
+            return "unknown", "state_check_failed"
+
+        if not positions:
+            return "stale", "position_missing"
+
+        position = positions[0]
+        amount = Decimal(position.get("positionAmt", "0"))
+        if amount == Decimal("0"):
+            return "stale", "position_closed"
+
+        try:
+            phase = int(watch.get("phase", 1))
+            if phase == 1:
+                if not self._is_regular_order_active(client, symbol, watch.get("tp1_order_id")):
+                    return "stale", "tp1_missing"
+                if not self._is_regular_order_active(client, symbol, watch.get("tp2_order_id")):
+                    return "stale", "tp2_missing"
+                if not self._is_algo_order_active(client, symbol, watch.get("sl_id")):
+                    return "stale", "sl_missing"
+                return "valid", "phase1_orders_ok"
+
+            if phase == 2:
+                if not self._is_regular_order_active(client, symbol, watch.get("tp2_order_id")):
+                    return "unknown", "phase_conflict_tp2"
+                if not self._is_algo_order_active(client, symbol, watch.get("sl_id")):
+                    return "unknown", "phase_conflict_sl"
+                return "valid", "phase2_orders_ok"
+
+            return "unknown", "phase_unknown"
+        except Exception as e:
+            logger.warning(f"校验订单状态失败 {symbol}: {format_exception(e)}")
+            return "unknown", "state_check_failed"
+
+    def _is_regular_order_active(self, client, symbol: str, order_id: Any) -> bool:
+        """检查普通订单是否仍然有效"""
+        if order_id is None:
+            return False
+
+        order = client.query_order(symbol=symbol, orderId=int(order_id))
+        status = (order.get("status") or "").upper()
+        return status not in {"FILLED", "CANCELED", "EXPIRED", "REJECTED"}
+
+    def _is_algo_order_active(self, client, symbol: str, algo_id: Any) -> bool:
+        """检查条件单是否仍然有效"""
+        if algo_id is None:
+            return False
+
+        order = client.query_algo_order(symbol=symbol, algoId=int(algo_id))
+        status = (order.get("status") or order.get("algoStatus") or "").upper()
+        return status not in {"FILLED", "CANCELED", "EXPIRED", "REJECTED"}
+
+    def _ensure_stream(self) -> None:
+        if self.stopping or self.ws_client or self.reconnect_task:
+            return
+        self.reconnect_task = asyncio.create_task(self._connect_user_stream())
+
+    async def _connect_user_stream(self) -> None:
+        try:
+            while not self.stopping and self.config.load_watches():
+                try:
+                    await self._open_user_stream()
+                    self.reconnect_attempts = 0
+                    return
+                except Exception as e:
+                    self.reconnect_attempts += 1
+                    delay = min(60, 5 * self.reconnect_attempts)
+                    logger.warning(
+                        f"用户数据流连接失败，第 {self.reconnect_attempts} 次，{delay}s 后重试: {format_exception(e)}"
+                    )
+                    await asyncio.sleep(delay)
+        finally:
+            self.reconnect_task = None
+
+    def restore_watches(self) -> None:
+        """从磁盘恢复监控任务"""
+        self._reset_restore_alerts()
+        watches = self.config.load_watches()
+        if not watches:
+            logger.info("没有需要恢复的监控任务")
+            return
+
+        logger.info(f"开始校验并恢复 {len(watches)} 个监控任务")
+        restored = 0
+        stale = 0
+        skipped = 0
+
         for symbol, watch in watches.items():
-            self.watch_tasks[symbol] = asyncio.create_task(self._watch_placeholder(symbol))
-            logger.info(f"监控任务已恢复: {symbol} phase={watch.get('phase', 1)}")
-        self._ensure_stream()
+            state, reason = self._get_restore_state(symbol, watch)
+            if state == "valid":
+                self.watch_tasks[symbol] = asyncio.create_task(self._watch_placeholder(symbol))
+                restored += 1
+                logger.info(f"监控任务已恢复: {symbol} phase={watch.get('phase', 1)} reason={reason}")
+            elif state == "stale":
+                self.remove_watch(symbol)
+                stale += 1
+                logger.info(f"监控任务已清理: {symbol} reason={reason}")
+                asyncio.create_task(self._notify_restore_issue(symbol, watch, state, reason))
+            else:
+                skipped += 1
+                logger.warning(f"监控任务跳过恢复: {symbol} reason={reason}")
+                asyncio.create_task(self._notify_restore_issue(symbol, watch, state, reason))
+
+        if skipped and not restored and not stale:
+            logger.warning("监控任务校验未能确认任何实时状态，本次未恢复本地 watch")
+
+        if restored:
+            self._ensure_stream()
+        elif stale and not skipped:
+            logger.info("监控任务校验完成，所有本地 watch 都已清理")
+
+        logger.info(
+            f"监控任务恢复完成: restored={restored}, stale={stale}, skipped={skipped}"
+        )
+
+    def _get_restore_state(self, symbol: str, watch: Dict[str, Any]) -> tuple[str, str]:
+        """检查监控任务是否仍需恢复"""
+        try:
+            client = create_client(self.config.api_key, self.config.api_secret, self.config.testnet)
+            positions = client.get_position_risk(symbol=symbol)
+        except Exception as e:
+            logger.warning(f"校验监控任务失败 {symbol}: {format_exception(e)}")
+            return "unknown", "state_check_failed"
+
+        if not positions:
+            return "stale", "position_missing"
+
+        position = positions[0]
+        amount = Decimal(position.get("positionAmt", "0"))
+        if amount == Decimal("0"):
+            return "stale", "position_closed"
+
+        try:
+            phase = int(watch.get("phase", 1))
+            if phase == 1:
+                if not self._is_regular_order_active(client, symbol, watch.get("tp1_order_id")):
+                    return "stale", "tp1_missing"
+                if not self._is_regular_order_active(client, symbol, watch.get("tp2_order_id")):
+                    return "stale", "tp2_missing"
+                if not self._is_algo_order_active(client, symbol, watch.get("sl_id")):
+                    return "stale", "sl_missing"
+                return "valid", "phase1_orders_ok"
+
+            if phase == 2:
+                if not self._is_regular_order_active(client, symbol, watch.get("tp2_order_id")):
+                    return "unknown", "phase_conflict_tp2"
+                if not self._is_algo_order_active(client, symbol, watch.get("sl_id")):
+                    return "unknown", "phase_conflict_sl"
+                return "valid", "phase2_orders_ok"
+
+            return "unknown", "phase_unknown"
+        except Exception as e:
+            logger.warning(f"校验订单状态失败 {symbol}: {format_exception(e)}")
+            return "unknown", "state_check_failed"
+
+    def _is_regular_order_active(self, client, symbol: str, order_id: Any) -> bool:
+        """检查普通订单是否仍然有效"""
+        if order_id is None:
+            return False
+
+        order = client.query_order(symbol=symbol, orderId=int(order_id))
+        status = (order.get("status") or "").upper()
+        return status not in {"FILLED", "CANCELED", "EXPIRED", "REJECTED"}
+
+    def _is_algo_order_active(self, client, symbol: str, algo_id: Any) -> bool:
+        """检查条件单是否仍然有效"""
+        if algo_id is None:
+            return False
+
+        order = client.query_algo_order(symbol=symbol, algoId=int(algo_id))
+        status = (order.get("status") or order.get("algoStatus") or "").upper()
+        return status not in {"FILLED", "CANCELED", "EXPIRED", "REJECTED"}
 
     def _ensure_stream(self) -> None:
         if self.stopping or self.ws_client or self.reconnect_task:
