@@ -1,0 +1,10 @@
+.env
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+bot.log
+settings.json
+watches.json
+*.log
+surge-ca-bundle.pem
