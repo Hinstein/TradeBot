@@ -61,6 +61,6 @@
 ### 开机自启（可选）
 ```bash
 cp trader-bot.plist ~/Library/LaunchAgents/
-# 修改里面的 /ABSOLUTE/PATH/TO/... 路径为新机器的实际用户名
+# 修改里面的 /ABSOLUTE/PATH/TO/... 路径为当前机器上的实际项目路径
 launchctl load ~/Library/LaunchAgents/trader-bot.plist
 ```
